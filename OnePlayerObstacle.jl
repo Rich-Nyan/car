@@ -25,7 +25,7 @@ using JuMP
 # Values
 T = 100
 dt = 0.1
-α = 1
+α = 0.1
 initial_pose = [0,0,0,0]
 final_pose = [4,4,pi/2,0]
 
@@ -41,7 +41,7 @@ function dynamics!(jacob, x, u)
     jacob[4] = u[2]
 end
 function objective_function(z)
-    s = sum(x -> x^2, z[4*T+1:6*T]) + sum(t -> penalty(z, t), 0:T+1)
+    s = sum(x -> x^2, z[4*T+1:6*T]) + sum(t -> penalty(z, t), 0:T-1)
     return s
 end
 
@@ -49,7 +49,6 @@ function distance(x)
     z = obstacle[1:2]
     return α * dot(x .- z, x .- z)
 end
-
 
 function penalty(z,t)
     x_t = [z[4*t+1], z[4*t+2]]
@@ -102,18 +101,25 @@ function lagrangian(z,λ, h_z)
     return f_z + dot(λ, h_z)
 end
 
-function gradient_f(z)
-    grad_f = zeros(QuadExpr, 10*T+4)
+function gradient_f(z,model)
+    grad_f = zeros(QuadExpr, 6*T)
     for i in 4*T+1:6*T
         grad_f[i] = 2 * z[i]
+    end
+    denom = @variable(model,[1:T])
+    for i in 1:T        
+        @NLconstraint(model, denom[i] == 1/((z[4*i-3]-obstacle[1])^2+(z[4*i-2]-obstacle[2])^2-obstacle[3]^2))
+        grad_f[4*i-3] = α * denom[i] * 2 * (z[4*i-3] - obstacle[1])
+        grad_f[4*i-2] = α * denom[i] * 2 * (z[4*i-2] - obstacle[2])
     end
     return grad_f
 end
 
+
 function gradient_h(z,model)
-    grad_h_z = zeros(QuadExpr,4*T+4,10*T+4)
-    for i in 1:4*T+4
-        for j in 1:10*T+4
+    grad_h_z = zeros(QuadExpr,6*T,4*T+4)
+    for i in 1:6*T
+        for j in 1:4*T+4
             grad_h_z[i,j] = 0
         end
     end
@@ -122,16 +128,16 @@ function gradient_h(z,model)
         grad_h_z[i,i] = 1
     end
     for i in 5:4*T
-        grad_h_z[i,i-4] = -1
+        grad_h_z[i-4,i] = -1
     end
     for i in 4T+1:4T+4
-        grad_h_z[i,i-4] = 1
+        grad_h_z[i-4,i] = 1
     end
 
     for i in 1:4*T
         if (i % 4 == 3)
-            grad_h_z[i,4*T+2*div(i-3,4)+1] = dt
-            grad_h_z[i+1,4*T+2*div(i-3,4)+2] = dt
+            grad_h_z[4*T+2*div(i-3,4)+1,i] = -dt
+            grad_h_z[4*T+2*div(i-3,4)+2,i+1] = -dt
         end
     end
 
@@ -141,12 +147,12 @@ function gradient_h(z,model)
     @NLconstraint(model, [t = 1:T-1], sine[t] == sin(z[4*t-1]))
     for i in 5:4*T
         if (i % 4 == 1)
-            grad_h_z[i,i-2] = sine[div(i-1,4)] * z[i-1] * dt
-            grad_h_z[i,i-1] = -cosine[div(i-1,4)] * dt
+            grad_h_z[i-2,i] = sine[div(i-1,4)] * z[i-1] * dt
+            grad_h_z[i-1,i] = -cosine[div(i-1,4)] * dt
         end
         if (i % 4 == 2)
-            grad_h_z[i,i-3] = -cosine[div(i-2,4)] * z[i-1] * dt
-            grad_h_z[i,i-2] = -sine[div(i-2,4)] * dt
+            grad_h_z[i-3,i] = -cosine[div(i-2,4)] * z[i-1] * dt
+            grad_h_z[i-2,i] = -sine[div(i-2,4)] * dt
         end
     end
 
@@ -156,25 +162,25 @@ end
 #Optimize Function
 function optimizer()
     model = Model(optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 5))
-    register(model, :norm, 1, norm; autodiff = true)
 
     @variable(model, z[i = 1:6 * T], start = z_guess[i])
-    @variable(model, λ[i = 1:4*T+4], start = z_guess[6*T+i])
+    
 
     h_z = dynamic_feasibility(z, model, T)
 
     # Objective
-    @objective(model, Min, objective_function(z))
+    # @objective(model, Min, objective_function(z))
 
     # Lagrange gradient
-    grad_f = gradient_f(z)
+    grad_f = gradient_f(z, model)
     grad_h = gradient_h(z, model)
 
-    λ_quad = sum(λ[i] * grad_h[j, i] for i in 1:4*T+4, j in 1:4*T+4)
-    grad_f_quad = sum(grad_f[i] for i in 4*T+1:6*T)
-
-    
-    @NLconstraint(model, norm(grad_f_quad + λ_quad) == 0)
+    @variable(model, λ[i = 1:4*T+4], start = z_guess[6*T+1])
+    for k in 1:6*T
+        λ_quad = @NLexpression(model, sum(λ[i] * grad_h[k, i] for i in 1:4*T+4))
+        grad_f_quad = @NLexpression(model, grad_f[k])
+        @NLconstraint(model, grad_f_quad - λ_quad == 0)
+    end
 
     for i in 1:4*T+4
         @constraint(model,h_z[i] == 0)
@@ -195,12 +201,12 @@ function optimizer()
         
         println("Iteration $i:")
         println("Objective: ", objective_value(model))
-        z_value = value.(z[6*T+1:end])
+        z_value = value.(λ[1:end])
         println("Constraints: ", norm(z_value))
     end
     
     # Write the trajectory to a file
-    open("obstacle_trajectory.txt", "w") do io
+    open("obstacleTrajectories/alpha1.txt", "w") do io
         for i in 1:iter
             for j in 1:T
                 println(io, states[i, j, 1], ",", states[i, j, 2], ",", states[i, j, 3], ",", states[i, j, 4])
